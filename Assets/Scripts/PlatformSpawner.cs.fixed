@@ -1,0 +1,551 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+public class PlatformSpawner : MonoBehaviour
+{
+    [Header("Prefabs & References")]
+    public List<GameObject> platformPrefabs;
+    public Transform player;
+    public Transform topKillPlane;
+    public Transform bottomKillPlane;
+
+    [Header("Spawn Settings")]
+    public float spawnThreshold = 20f;        // Distance ahead to maintain platforms
+    public float horizontalSpacingMin = 0.5f; // Min spacing between platforms (easily jumpable)
+    public float horizontalSpacingMax = 1.5f; // Max spacing between platforms (challenging but possible)
+    public float platformHeight = -1.5f;      // Default Y position for platforms
+    [Range(-2.0f, 2.0f)]
+    public float heightVariationMax = 1.0f;   // Maximum platform height variation
+
+    // Private tracking variables
+    private Vector3 nextSpawnPosition;
+    private List<GameObject> activePlatforms = new List<GameObject>();
+
+    void Start()
+    {
+        // Setup or create ScrollController for endless mode
+        if (ScrollController.Instance == null)
+        {
+            // Create a new ScrollController if one doesn't exist
+            GameObject scrollControllerObj = new GameObject("ScrollController");
+            ScrollController controller = scrollControllerObj.AddComponent<ScrollController>();
+            controller.isEndlessRunnerMode = true;
+            controller.isScrolling = true;
+            controller.scrollSpeed = 5f;
+            Debug.Log("[PlatformSpawner] Created new ScrollController");
+        }
+
+        // Now ScrollController.Instance should exist
+        ScrollController.Instance.isEndlessRunnerMode = true;
+        ScrollController.Instance.isScrolling = true;
+        // Set a higher scroll speed to make platforms move faster
+        ScrollController.Instance.scrollSpeed = 12f;
+        ScrollController.Instance.maxSpeed = 20f;
+        // Set a longer startup delay (3 seconds) to give Mario time to land safely
+        ScrollController.Instance.startDelay = 3.0f;
+        // Reset the start time to ensure full delay takes effect
+        ScrollController.Instance.ResetStartTime();
+        Debug.Log($"[PlatformSpawner] Enabled endless runner mode with speed {ScrollController.Instance.scrollSpeed} and startup delay {ScrollController.Instance.startDelay}");
+
+        // Get the ground platform Y position if available
+        GameObject groundPlatform = GameObject.Find("Ground");
+        if (groundPlatform != null)
+        {
+            platformHeight = groundPlatform.transform.position.y;
+            Debug.Log($"[PlatformSpawner] Using ground height: {platformHeight}");
+
+            // Make sure Ground has MoveLeft component
+            if (groundPlatform.GetComponent<MoveLeft>() == null)
+            {
+                groundPlatform.AddComponent<MoveLeft>();
+            }
+
+            // Find the End marker of the ground platform to connect the next platform
+            Transform groundEndMarker = groundPlatform.transform.Find("End");
+            if (groundEndMarker != null)
+            {
+                // Use the end marker position of the ground platform as the next spawn position
+                nextSpawnPosition = new Vector3(groundEndMarker.position.x, platformHeight, 0);
+                Debug.Log($"[PlatformSpawner] Initial nextSpawnPosition set based on ground platform end: {nextSpawnPosition}");
+            }
+            else
+            {
+                // Fallback if no End marker found
+                float rightEdge = Camera.main.transform.position.x + Camera.main.aspect * Camera.main.orthographicSize;
+                nextSpawnPosition = new Vector3(rightEdge, platformHeight, 0);
+                Debug.Log($"[PlatformSpawner] No End marker found on ground platform, using camera view: {nextSpawnPosition}");
+            }
+        }
+        else
+        {
+            // No ground platform found, use camera view
+            float rightEdge = Camera.main.transform.position.x + Camera.main.aspect * Camera.main.orthographicSize;
+            nextSpawnPosition = new Vector3(rightEdge, platformHeight, 0);
+            Debug.Log($"[PlatformSpawner] No ground platform found, using camera view: {nextSpawnPosition}");
+        }
+
+        // Create initial set of platforms
+        // Only generate 3 initial platforms to reduce early platform movement
+        for (int i = 0; i < 3; i++)
+        {
+            SpawnPlatform();
+        }
+    }
+
+    void Update()
+    {
+        // First ensure we have enough platforms
+        if (activePlatforms.Count < 3)
+        {
+            Debug.LogWarning($"[PlatformSpawner] Only {activePlatforms.Count} active platforms! Spawning more.");
+            SpawnPlatform();
+        }
+
+        // Fix platform movement by ensuring ScrollController is working
+        FixPlatformMovement();
+
+        // Check if platforms are actually moving
+        if (activePlatforms.Count > 0 && Time.frameCount % 90 == 0)
+        {
+            GameObject firstPlatform = activePlatforms[0];
+            if (firstPlatform != null)
+            {
+                Debug.Log($"[PlatformSpawner] First platform position: {firstPlatform.transform.position.x}");
+
+                // Calculate the delta between camera and platforms
+                float cameraDelta = Camera.main.transform.position.x - firstPlatform.transform.position.x;
+                Debug.Log($"[PlatformSpawner] Camera to platform distance: {cameraDelta}");
+
+                // If platforms are very far behind the camera, something is wrong
+                if (cameraDelta > 30f)
+                {
+                    Debug.LogWarning($"[PlatformSpawner] Platforms too far behind camera! Resetting spawn system.");
+                    ResetPlatformSystem();
+                }
+            }
+        }
+
+        // Check if we need to spawn more platforms
+        float rightEdge = Camera.main.transform.position.x + Camera.main.aspect * Camera.main.orthographicSize;
+        float visibleRightEdge = rightEdge + spawnThreshold;
+
+        // Force update next spawn position if it seems invalid
+        if (nextSpawnPosition.x < rightEdge - 10)
+        {
+            Debug.LogWarning($"[PlatformSpawner] Next spawn position ({nextSpawnPosition.x}) is behind camera view! Resetting.");
+            nextSpawnPosition.x = rightEdge + 5f;
+        }
+
+        // Log positions periodically (for debugging)
+        if (Time.frameCount % 60 == 0)
+        {
+            Debug.Log($"[PlatformSpawner] Right edge: {rightEdge}, Spawn threshold: {visibleRightEdge}, Next spawn X: {nextSpawnPosition.x}");
+            Debug.Log($"[PlatformSpawner] Active platforms: {activePlatforms.Count}");
+
+            if (ScrollController.Instance != null)
+            {
+                Debug.Log($"[PlatformSpawner] ScrollController status - endlessRunner:{ScrollController.Instance.isEndlessRunnerMode}, " +
+                          $"scrolling:{ScrollController.Instance.isScrolling}, hasStarted:{ScrollController.Instance.hasStartedMoving}, " +
+                          $"speed:{ScrollController.Instance.scrollSpeed}");
+            }
+        }
+
+        // Always spawn new platforms if needed
+        if (nextSpawnPosition.x < visibleRightEdge)
+        {
+            SpawnPlatform();
+
+            // Verify that nextSpawnPosition was updated
+            if (nextSpawnPosition.x < visibleRightEdge)
+            {
+                Debug.LogWarning("[PlatformSpawner] Next spawn position didn't advance enough after spawning. Forcing forward.");
+                nextSpawnPosition.x = rightEdge + spawnThreshold / 2;
+            }
+        }
+
+        // Cleanup platforms that are far off-screen
+        CleanupPlatforms();
+    }
+
+    void SpawnPlatform()
+    {
+        if (platformPrefabs.Count == 0)
+        {
+            Debug.LogError("[PlatformSpawner] No platform prefabs assigned!");
+            return;
+        }
+
+        // Pick a random platform prefab
+        GameObject prefab = platformPrefabs[Random.Range(0, platformPrefabs.Count)];
+
+        // DEBUGGING - Print out the platform prefab's children to ensure markers exist
+        Debug.Log($"[PlatformSpawner] Prefab {prefab.name} structure:");
+        foreach (Transform child in prefab.transform)
+        {
+            Debug.Log($"[PlatformSpawner] - Child: {child.name}");
+        }
+
+        // Find the Start and End markers on the prefab
+        Transform startMarker = prefab.transform.Find("Start");
+        Transform endMarker = prefab.transform.Find("End");
+
+        if (startMarker == null || endMarker == null)
+        {
+            // If markers aren't found, create them at prefab bounds
+            Debug.LogWarning($"[PlatformSpawner] Platform prefab {prefab.name} is missing Start or End markers! Creating temporary markers.");
+
+            // Create markers if missing (emergency fix)
+            BoxCollider2D collider = prefab.GetComponent<BoxCollider2D>();
+            if (collider != null)
+            {
+                float width = collider.size.x;
+                if (startMarker == null)
+                {
+                    GameObject start = new GameObject("Start");
+                    start.transform.SetParent(prefab.transform);
+                    start.transform.localPosition = new Vector3(-width / 2, 0, 0);
+                    startMarker = start.transform;
+                }
+
+                if (endMarker == null)
+                {
+                    GameObject end = new GameObject("End");
+                    end.transform.SetParent(prefab.transform);
+                    end.transform.localPosition = new Vector3(width / 2, 0, 0);
+                    endMarker = end.transform;
+                }
+            }
+            else
+            {
+                Debug.LogError($"[PlatformSpawner] Platform prefab {prefab.name} has no collider to use for marker creation!");
+                return;
+            }
+        }
+
+        // Add proper spacing between platforms (this is for INITIAL positioning only)
+        float spacing = 0f;  // Set to 0 since we'll handle gaps when setting the next position
+
+        // For the first few platforms, ensure they're positioned correctly
+        if (activePlatforms.Count < 2)
+        {
+            // First platform should be close to the ground platform but with a clear gap
+            spacing = 1.5f; // Smaller gap for first platform
+            Debug.Log($"[PlatformSpawner] Using clear gap for first platform: {spacing}");
+        }
+        else if (!ScrollController.Instance.hasStartedMoving)
+        {
+            // Before movement starts, use consistent positioning with visible gaps
+            spacing = 1.0f;
+            Debug.Log($"[PlatformSpawner] Using fixed spacing during startup delay: {spacing}");
+        }
+
+        // Vary the height of platforms
+        float heightVariation = 0f;
+        if (activePlatforms.Count >= 2)  // Only vary height after first platform
+        {
+            // Random height variation within jumpable range
+            heightVariation = Random.Range(-0.8f, 1.0f);
+        }
+
+        // Calculate spawn position - nextSpawnPosition is where we want the START of the platform
+        Vector3 spawnPosition = nextSpawnPosition;
+
+        // Add height variation (but not for the first platform)
+        spawnPosition.y = platformHeight + heightVariation;
+
+        // CRITICAL FIX: Account for the Start marker's local position correctly
+        // We need to position the platform so its Start marker aligns with nextSpawnPosition
+        spawnPosition.x -= startMarker.localPosition.x;
+        spawnPosition.y -= startMarker.localPosition.y;
+
+        // Ensure platform isn't too low or too high
+        if (spawnPosition.y < -3.5f) spawnPosition.y = -3.5f - startMarker.localPosition.y;
+        if (spawnPosition.y > 1.5f) spawnPosition.y = 1.5f - startMarker.localPosition.y;
+
+        // Create the platform
+        GameObject newPlatform = Instantiate(prefab, spawnPosition, Quaternion.identity);
+        Debug.Log($"[PlatformSpawner] Instantiated platform at position {spawnPosition}");
+
+        // Make the platform a child of this spawner to keep hierarchy clean
+        newPlatform.transform.parent = this.transform;
+
+        // Ensure it has a MoveLeft component
+        MoveLeft mover = newPlatform.GetComponent<MoveLeft>();
+        if (mover == null)
+        {
+            mover = newPlatform.AddComponent<MoveLeft>();
+            Debug.Log($"[PlatformSpawner] Added MoveLeft to {newPlatform.name}");
+        }
+
+        // Add to our list of active platforms
+        activePlatforms.Add(newPlatform);
+
+        // Get the End marker position on the actual instantiated platform
+        Transform newEndMarker = newPlatform.transform.Find("End");
+        if (newEndMarker == null)
+        {
+            Debug.LogError($"[PlatformSpawner] End marker not found on instantiated platform {newPlatform.name}!");
+            // Emergency fallback - create an end marker
+            GameObject end = new GameObject("End");
+            end.transform.SetParent(newPlatform.transform);
+            BoxCollider2D collider = newPlatform.GetComponent<BoxCollider2D>();
+            if (collider != null)
+            {
+                end.transform.localPosition = new Vector3(collider.size.x / 2, 0, 0);
+            }
+            else
+            {
+                end.transform.localPosition = new Vector3(5f, 0, 0); // Arbitrary fallback
+            }
+            newEndMarker = end.transform;
+        }
+
+        // Visual debugging - add spheres to see markers
+        GameObject startSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        startSphere.name = "DEBUG_StartMarker";
+        startSphere.transform.position = newPlatform.transform.Find("Start").position;
+        startSphere.transform.localScale = Vector3.one * 0.3f;
+        startSphere.GetComponent<Renderer>().material.color = Color.blue;
+        Destroy(startSphere.GetComponent<Collider>());
+        startSphere.transform.parent = newPlatform.transform;
+
+        GameObject endSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        endSphere.name = "DEBUG_EndMarker";
+        endSphere.transform.position = newEndMarker.position;
+        endSphere.transform.localScale = Vector3.one * 0.3f;
+        endSphere.GetComponent<Renderer>().material.color = Color.red;
+        Destroy(endSphere.GetComponent<Collider>());
+        endSphere.transform.parent = newPlatform.transform;
+
+        // Show height variation visually
+        if (Mathf.Abs(heightVariation) > 0.1f)
+        {
+            GameObject heightMarker = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            heightMarker.name = "DEBUG_HeightVariation";
+            heightMarker.transform.position = new Vector3(
+                newPlatform.transform.position.x,
+                platformHeight,
+                0.5f); // Slightly behind platform
+            heightMarker.transform.localScale = new Vector3(0.2f, Mathf.Abs(heightVariation), 0.2f);
+
+            // Color based on direction (green=up, red=down)
+            heightMarker.GetComponent<Renderer>().material.color =
+                heightVariation > 0 ? new Color(0, 0.8f, 0, 0.3f) : new Color(0.8f, 0, 0, 0.3f);
+
+            Destroy(heightMarker.GetComponent<Collider>());
+            heightMarker.transform.parent = newPlatform.transform;
+        }
+
+        // CRITICAL FIX: Add gap after the end marker for next platform
+        float nextGap;
+
+        // Always use smaller, more consistent gaps for better gameplay
+        // This makes ALL gaps easier to jump, not just the first few
+        nextGap = Random.Range(0.5f, 1.2f);
+        Debug.Log($"[PlatformSpawner] Using consistent gap: {nextGap}");
+
+        nextSpawnPosition = new Vector3(newEndMarker.position.x + nextGap, platformHeight, 0f);
+
+        // Visual indicator for the next spawn position
+        GameObject nextPosMarker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        nextPosMarker.name = "DEBUG_NextSpawnPos";
+        nextPosMarker.transform.position = nextSpawnPosition;
+        nextPosMarker.transform.localScale = Vector3.one * 0.5f;
+        nextPosMarker.GetComponent<Renderer>().material.color = Color.yellow;
+        Destroy(nextPosMarker.GetComponent<Collider>());
+        Destroy(nextPosMarker, 3.0f); // Clean up after 3 seconds
+
+        // Detailed debug logging
+        Debug.Log($"[PlatformSpawner] Spawned {newPlatform.name} at {spawnPosition}");
+        Debug.Log($"[PlatformSpawner] End marker at {newEndMarker.position}, added gap of {nextGap}, next spawn at {nextSpawnPosition}");
+
+        // Safety check - if the next spawn position isn't advancing enough, force it forward
+        if (nextSpawnPosition.x <= spawnPosition.x + 1.0f)
+        {
+            float platformWidth = 10f; // Fallback width
+
+            // Try to determine platform width
+            BoxCollider2D collider = newPlatform.GetComponent<BoxCollider2D>();
+            if (collider != null)
+            {
+                platformWidth = collider.size.x;
+            }
+
+            // Force next position forward if it didn't advance
+            nextSpawnPosition.x = spawnPosition.x + platformWidth + nextGap;
+            Debug.LogWarning($"[PlatformSpawner] Next spawn position wasn't advancing enough! Forced to {nextSpawnPosition.x}");
+        }
+    }
+
+    // Helper method to check and fix MoveLeft components on all platforms
+    private void FixPlatformMovement()
+    {
+        // First check if ScrollController is working
+        if (ScrollController.Instance == null)
+        {
+            Debug.LogError("[PlatformSpawner] ScrollController.Instance is null! Recreating it.");
+            GameObject scrollControllerObj = new GameObject("ScrollController");
+            ScrollController controller = scrollControllerObj.AddComponent<ScrollController>();
+            controller.isEndlessRunnerMode = true;
+            controller.isScrolling = true;
+            controller.scrollSpeed = 10f;
+            // Important: Make it DontDestroyOnLoad to prevent destruction
+            DontDestroyOnLoad(scrollControllerObj);
+        }
+
+        // Make sure it's set to scroll
+        if (ScrollController.Instance != null)
+        {
+            // FORCE enable all required settings
+            ScrollController.Instance.isEndlessRunnerMode = true;
+            ScrollController.Instance.isScrolling = true;
+
+            // Only force hasStartedMoving to true if we've waited long enough
+            // Check if we've exceeded the delay period by a significant amount
+            if (!ScrollController.Instance.hasStartedMoving &&
+                Time.time > (ScrollController.Instance.startTime + ScrollController.Instance.startDelay + 2.0f))
+            {
+                // Only force movement if we're really stuck
+                ScrollController.Instance.hasStartedMoving = true;
+                Debug.LogWarning("[PlatformSpawner] Forced hasStartedMoving to true after extended delay");
+            }
+
+            // Increase speed for more obvious movement
+            if (ScrollController.Instance.scrollSpeed < 8f)
+            {
+                ScrollController.Instance.scrollSpeed = 10f;
+                ScrollController.Instance.maxSpeed = 15f;
+                Debug.Log($"[PlatformSpawner] Set ScrollController speed to {ScrollController.Instance.scrollSpeed}");
+            }
+        }
+
+        // Check all platforms to ensure they have MoveLeft components
+        int fixedCount = 0;
+        foreach (GameObject platform in activePlatforms)
+        {
+            if (platform != null)
+            {
+                MoveLeft mover = platform.GetComponent<MoveLeft>();
+                if (mover == null)
+                {
+                    mover = platform.AddComponent<MoveLeft>();
+                    fixedCount++;
+                }
+            }
+        }
+
+        // Check Ground platform too
+        GameObject ground = GameObject.Find("Ground");
+        if (ground != null)
+        {
+            MoveLeft groundMover = ground.GetComponent<MoveLeft>();
+            if (groundMover == null)
+            {
+                groundMover = ground.AddComponent<MoveLeft>();
+                Debug.Log("[PlatformSpawner] Added MoveLeft to Ground platform");
+            }
+        }
+
+        if (fixedCount > 0 && Time.frameCount % 30 == 0)
+        {
+            Debug.Log($"[PlatformSpawner] Fixed MoveLeft on {fixedCount} platforms");
+        }
+    }
+
+    void CleanupPlatforms()
+    {
+        float leftEdge = Camera.main.transform.position.x - Camera.main.aspect * Camera.main.orthographicSize;
+        float cleanupX = leftEdge - 20f; // Far enough off screen to the left
+
+        // Check each platform and remove those that are off screen
+        for (int i = activePlatforms.Count - 1; i >= 0; i--)
+        {
+            if (activePlatforms[i] == null)
+            {
+                activePlatforms.RemoveAt(i);
+                continue;
+            }
+
+            // Skip any platform named "Ground" (we want to keep it)
+            if (activePlatforms[i].name.Contains("Ground"))
+            {
+                continue;
+            }
+
+            // Get the rightmost point of the platform
+            Transform endMarker = activePlatforms[i].transform.Find("End");
+            float rightmostX = endMarker != null ? endMarker.position.x : activePlatforms[i].transform.position.x;
+
+            // If the entire platform is off screen, destroy it
+            if (rightmostX < cleanupX)
+            {
+                Debug.Log($"[PlatformSpawner] Destroying offscreen platform {activePlatforms[i].name}");
+                Destroy(activePlatforms[i]);
+                activePlatforms.RemoveAt(i);
+            }
+        }
+    }
+
+    // Method to reset the entire platform system if things get out of sync
+    private void ResetPlatformSystem()
+    {
+        Debug.Log("[PlatformSpawner] Resetting platform system!");
+
+        // Clear all existing platforms
+        foreach (GameObject platform in activePlatforms)
+        {
+            if (platform != null && !platform.name.Contains("Ground"))
+            {
+                Destroy(platform);
+            }
+        }
+        activePlatforms.Clear();
+
+        // Reset the next spawn position
+        float rightEdge = Camera.main.transform.position.x + Camera.main.aspect * Camera.main.orthographicSize;
+        nextSpawnPosition = new Vector3(rightEdge + 5f, platformHeight, 0f);
+
+        // Spawn initial set of platforms
+        for (int i = 0; i < 3; i++)
+        {
+            SpawnPlatform();
+        }
+
+        // Reset the scroll controller if needed
+        if (ScrollController.Instance != null)
+        {
+            ScrollController.Instance.isEndlessRunnerMode = true;
+            ScrollController.Instance.isScrolling = true;
+            ScrollController.Instance.scrollSpeed = 10f;
+            ScrollController.Instance.hasStartedMoving = true;
+        }
+    }
+
+    // Visual debugging in the editor
+    void OnDrawGizmos()
+    {
+        if (!Application.isPlaying) return;
+
+        // Draw a sphere at the next spawn position
+        Gizmos.color = Color.green;
+        Gizmos.DrawSphere(nextSpawnPosition, 0.5f);
+
+        // Draw a line showing spawn threshold
+        if (Camera.main != null)
+        {
+            float rightEdge = Camera.main.transform.position.x + Camera.main.aspect * Camera.main.orthographicSize;
+            float visibleRightEdge = rightEdge + spawnThreshold;
+            Vector3 thresholdStart = new Vector3(visibleRightEdge, Camera.main.transform.position.y - 10, 0);
+            Vector3 thresholdEnd = new Vector3(visibleRightEdge, Camera.main.transform.position.y + 10, 0);
+
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawLine(thresholdStart, thresholdEnd);
+
+            // Draw camera right edge
+            Gizmos.color = Color.red;
+            thresholdStart = new Vector3(rightEdge, Camera.main.transform.position.y - 10, 0);
+            thresholdEnd = new Vector3(rightEdge, Camera.main.transform.position.y + 10, 0);
+            Gizmos.DrawLine(thresholdStart, thresholdEnd);
+        }
+    }
+}
